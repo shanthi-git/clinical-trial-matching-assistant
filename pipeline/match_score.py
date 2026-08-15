@@ -1,8 +1,9 @@
-# pipeline/match_score.py
 from sentence_transformers import SentenceTransformer, util
 from models.schemas import PatientProfile, TrialCriteria
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+BIOMARKER_BOOST_WEIGHT = 0.15  # tune this to control how much exact biomarker overlap matters
 
 def profile_to_text(p: PatientProfile) -> str:
     return f"Diagnosis: {', '.join(p.diagnosis)}. Age: {p.age}. " \
@@ -26,12 +27,31 @@ def hard_filter(patient: PatientProfile, criteria: TrialCriteria) -> bool:
         return False
     return True
 
+def biomarker_boost(patient: PatientProfile, criteria: TrialCriteria) -> float:
+    """
+    Reward explicit biomarker overlap. Embedding similarity captures general
+    topical closeness but doesn't reliably weight exact-match criteria like
+    'KRAS G12C' the way a real matching system needs to. This boost is a
+    simple, transparent fix layered on top of the embedding score rather
+    than relying on the embedding to infer exact-term significance.
+    """
+    if not criteria.biomarkers:
+        return 0.0
+    # Case-insensitive comparison since LLM extraction and patient input casing can vary
+    patient_markers = {b.strip().lower() for b in patient.biomarkers}
+    criteria_markers = {b.strip().lower() for b in criteria.biomarkers}
+    overlap = patient_markers & criteria_markers
+    return BIOMARKER_BOOST_WEIGHT * len(overlap)
+
 def score_trial(patient: PatientProfile, criteria: TrialCriteria) -> float:
     if not hard_filter(patient, criteria):
         return 0.0
     p_emb = embedder.encode(profile_to_text(patient), convert_to_tensor=True)
     c_emb = embedder.encode(criteria_to_text(criteria), convert_to_tensor=True)
-    return float(util.cos_sim(p_emb, c_emb).item())
+    base_score = float(util.cos_sim(p_emb, c_emb).item())
+    boost = biomarker_boost(patient, criteria)
+    # Cap at 1.0 so the boost can't push a score above the theoretical max
+    return min(1.0, round(base_score + boost, 4))
 
 def rank_trials(patient: PatientProfile, trials_with_criteria: list[tuple[dict, TrialCriteria]]) -> list[dict]:
     scored = []
